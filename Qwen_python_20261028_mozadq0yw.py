@@ -67,15 +67,10 @@ def init_db():
                 discussion_chat_id INTEGER NOT NULL,
                 thread_id INTEGER NOT NULL,
                 list_message_id INTEGER,
+                ticket_price INTEGER DEFAULT 0,
                 PRIMARY KEY (channel_id, post_id)
             )
         """)
-        # Миграция: добавляем ticket_price, если её нет
-        try:
-            DB.execute("ALTER TABLE lots ADD COLUMN ticket_price INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-
         DB.execute("""
             CREATE TABLE IF NOT EXISTS lot_tickets (
                 channel_id INTEGER NOT NULL,
@@ -884,7 +879,8 @@ async def finalize_auction(context, channel_id, post_id):
     logger.info("Аукцион %s/%s завершен по времени", channel_id, post_id)
     await update_auction_post(context, channel_id, post_id)
 
-async def check_auctions_job(context):
+async def check_expired_auctions(context):
+    """Проверяет и завершает истекшие аукционы (вызывается при каждом сообщении)."""
     now = datetime.now().isoformat()
     expired = DB.execute("""
         SELECT channel_id, post_id FROM auctions
@@ -978,7 +974,6 @@ async def oplata_cmd(update, context):
         await message.reply_text("❌ Команда работает только в комментариях к посту лотереи")
         return
 
-    # Получаем лотерею
     lot = DB.execute("""
         SELECT channel_id, post_id, lot_number, ticket_price
         FROM lots WHERE discussion_chat_id = ? AND thread_id = ?
@@ -989,34 +984,6 @@ async def oplata_cmd(update, context):
         return
 
     channel_id, post_id, lot_number, ticket_price = lot
-
-    # Проверяем наличие хэштега лотереи в исходном посте
-    original_post = DB.execute("""
-        SELECT base_caption FROM shops WHERE channel_id = ? AND post_id = ?
-    """, (channel_id, post_id)).fetchone()
-
-    # Если в shops нет (только лотерея), получаем через lot
-    post_text = ""
-    if original_post:
-        post_text = original_post[0]
-    else:
-        # Попробуем получить из lots (сохраняем base_caption при создании)
-        # Для этого ищем пост через forward
-        try:
-            # Проверяем discussion_posts
-            dp = DB.execute("""
-                SELECT channel_id, post_id FROM discussion_posts
-                WHERE discussion_chat_id = ? AND thread_id = ?
-            """, (message.chat.id, thread_id)).fetchone()
-            if dp:
-                # Не можем напрямую получить текст поста — проверяем через lot
-                # Если лотерея существует, значит хэштег был при создании
-                pass
-        except Exception:
-            pass
-
-    # Если лотерея была создана, значит хэштег был (create_lottery проверяет LOTTERY_PATTERN)
-    # Дополнительная проверка не нужна — сам факт наличия записи в lots подтверждает хэштег
 
     if ticket_price <= 0:
         await message.reply_text(
@@ -1095,8 +1062,7 @@ async def result_cmd(update, context):
     winning_number = winning_ticket[0]
     winner_label = winning_ticket[1]
 
-    # Определяем правильный хэштег по lot_number
-    # Ищем оригинальный пост, чтобы узнать тип хэштега
+    # Определяем правильный хэштег по типу лотереи
     original_post = DB.execute("""
         SELECT base_caption FROM shops WHERE channel_id = ? AND post_id = ?
     """, (channel_id, post_id)).fetchone()
@@ -1127,6 +1093,9 @@ async def result_cmd(update, context):
 # ALL COMMENTS
 # =====================================================
 async def handle_all_comments(update, context):
+    # Сначала проверяем истекшие аукционы (ленивая проверка)
+    await check_expired_auctions(context)
+
     # 1. Сначала аукцион (самый специфичный)
     handled = await handle_auction_comment(update, context)
     if handled:
@@ -1251,9 +1220,6 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_comments),
         group=0,
     )
-
-    # Таймер: проверяет окончание аукционов каждые 30 секунд
-    app.job_queue.run_repeating(check_auctions_job, interval=30, first=10)
 
     logger.info("Бот запущен")
     app.run_polling()
